@@ -48,6 +48,24 @@ export interface Cue {
   duplicateOf: string | null
   followupText: string
   tags: string[]
+  relatedTo: string | null
+}
+
+export type ReviewResolution = 'merged' | 'admitted' | 'use-staged' | 'keep-live' | 'linked'
+
+export interface ReviewItem {
+  id: string
+  stagedText: string
+  speakerId: string
+  receivedAt: number
+  manual: boolean
+  matchKind: 'exact' | 'similar' | 'none'
+  matchCueId: string | null
+  similarity: number
+  status: 'pending' | 'resolved'
+  resolution: ReviewResolution | null
+  resultCueId: string | null
+  resolvedAt: number | null
 }
 
 export interface Reminder {
@@ -66,6 +84,7 @@ export interface DeskState {
   announcements: Announcement[]
   cues: Cue[]
   reminders: Reminder[]
+  reviewQueue: ReviewItem[]
   activeCueId: string
   fontScale: number
   online: boolean

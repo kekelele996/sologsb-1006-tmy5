@@ -1,13 +1,14 @@
 <script lang="ts">
   import { onMount } from 'svelte'
+  import { get } from 'svelte/store'
   import Button from 'flowbite-svelte/Button.svelte'
   import {
     acknowledgeReminder, addAnnouncement, addSession, addSpeaker, addTerm, canRedo, canUndo, clearDuplicate,
-    deleteCue, desk, getDelay, ingestCue, moveCue, publishAnnouncement, redoDesk, sendReminder, setActiveCue,
-    setCueStatus, setFontScale, setLiveSimulation, setOnline, speakerName, termTarget, undoDesk, updateCue,
-    updateSession, updateSpeaker, updateTerm
+    clearResolvedReviews, deleteCue, desk, getDelay, ingestCue, moveCue, publishAnnouncement, redoDesk,
+    resolveReview, sendReminder, setActiveCue, setCueStatus, setFontScale, setLiveSimulation, setOnline,
+    speakerName, termTarget, undoDesk, updateCue, updateSession, updateSpeaker, updateTerm
   } from '$lib/store'
-  import type { Announcement, Cue, Session, TabId, Term } from '$lib/types'
+  import type { Announcement, Cue, ReviewItem, Session, TabId, Term } from '$lib/types'
 
   const liveLines = [
     'Cooling corridors can connect parks, schools, and shaded transit stops.',
@@ -31,18 +32,25 @@
   let showHelp = false
 
   $: currentSession = $desk.sessions.find(item => item.status === 'live') || $desk.sessions[0]
-  $: activeCue = $desk.cues.find(item => item.id === $desk.activeCueId) || $desk.cues.at(-1)
-  $: pendingCount = $desk.cues.filter(item => item.status === 'pending').length
+  $: liveCues = $desk.cues.filter(item => !item.offline)
+  $: activeCue = liveCues.find(item => item.id === $desk.activeCueId) || liveCues.at(-1)
+  $: pendingCount = liveCues.filter(item => item.status === 'pending').length
   $: offlineCount = $desk.cues.filter(item => item.offline).length
-  $: lateCount = $desk.cues.filter(item => getDelay(item, now) > 8 && item.status !== 'confirmed').length
-  $: duplicateCount = $desk.cues.filter(item => item.duplicateOf).length
+  $: lateCount = liveCues.filter(item => getDelay(item, now) > 8 && item.status !== 'confirmed').length
+  $: duplicateCount = liveCues.filter(item => item.duplicateOf).length
+  $: pendingReviews = $desk.reviewQueue.filter(item => item.status === 'pending')
+  $: resolvedReviews = $desk.reviewQueue.filter(item => item.status === 'resolved')
   $: activeSpeaker = $desk.speakers.find(item => item.id === activeCue?.speakerId)
   $: activeTerms = $desk.terms.filter(item => item.speakerId === activeCue?.speakerId || activeCue?.tags.includes(item.target))
   $: unreadReminders = $desk.reminders.filter(item => !item.acknowledged)
 
   onMount(() => {
     if (typeof navigator !== 'undefined') setOnline(navigator.onLine)
-    const onlineHandler = () => setOnline(true)
+    const onlineHandler = () => {
+      setOnline(true)
+      const pending = get(desk).reviewQueue.filter(item => item.status === 'pending').length
+      if (pending > 0) flash(`连接已恢复：相同内容已自动并入，${pending} 条相近内容进入待核对队列。`)
+    }
     const offlineHandler = () => setOnline(false)
     window.addEventListener('online', onlineHandler)
     window.addEventListener('offline', offlineHandler)
@@ -93,7 +101,26 @@
   }
   function mergeOffline() {
     setOnline(true)
-    flash('网络已恢复，离线内容已合并并完成重复检查。')
+    const pending = get(desk).reviewQueue.filter(item => item.status === 'pending').length
+    if (pending > 0) {
+      tab = 'offline'
+      flash(`连接已恢复：相同内容已自动并入原条目，${pending} 条相近内容待核对。`)
+    } else {
+      flash('连接已恢复，离线内容已合并，无待核对内容。')
+    }
+  }
+  function reviewText(id: string | null) {
+    return $desk.cues.find(item => item.id === id)?.text || '（原条目已被删除）'
+  }
+  function resolutionLabel(resolution: ReviewItem['resolution']) {
+    const labels: Record<string, string> = {
+      merged: '内容相同 · 已并入原条目',
+      admitted: '无相近内容 · 已进入现场队列',
+      'use-staged': '已采用暂存版',
+      'keep-live': '已采用现场版',
+      linked: '两版保留 · 已建立关联'
+    }
+    return labels[resolution ?? ''] || '已处理'
   }
   function sendTermReminder(termId: string) {
     if (!activeCue) return
@@ -150,7 +177,7 @@
           <button class="focus-ring whitespace-nowrap rounded-lg px-4 py-2 text-xs font-bold transition {tab === item[0] ? 'bg-white text-ink shadow' : 'text-slate-300 hover:bg-slate-700'}" aria-current={tab === item[0] ? 'page' : undefined} on:click={() => tab = item[0] as TabId}>
             {item[1]}
             {#if item[0] === 'live' && pendingCount}<span class="ml-2 rounded-full bg-orange-500 px-1.5 py-0.5 text-[10px] text-white">{pendingCount}</span>{/if}
-            {#if item[0] === 'offline' && offlineCount}<span class="ml-2 rounded-full bg-amber-500 px-1.5 py-0.5 text-[10px] text-white">{offlineCount}</span>{/if}
+            {#if item[0] === 'offline' && offlineCount + pendingReviews.length > 0}<span class="ml-2 rounded-full px-1.5 py-0.5 text-[10px] text-white {pendingReviews.length ? 'bg-red-500' : 'bg-amber-500'}">{offlineCount + pendingReviews.length}</span>{/if}
           </button>
         {/each}
       </nav>
@@ -185,6 +212,13 @@
         </div>
       </div>
 
+      {#if pendingReviews.length}
+        <div class="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3" role="alert">
+          <p class="text-sm font-bold text-amber-900">待核对队列还有 {pendingReviews.length} 条恢复内容，处理完成前不会进入现场输出。</p>
+          <Button size="sm" color="yellow" on:click={() => tab = 'offline'}>前往核对</Button>
+        </div>
+      {/if}
+
       <div class="grid gap-4 xl:grid-cols-[minmax(0,1.65fr)_minmax(300px,.75fr)]">
         <div class="space-y-4">
           <section class="overflow-hidden rounded-2xl border border-teal-800 bg-[#0d3b36] text-white shadow-lg">
@@ -196,13 +230,13 @@
               {#each $desk.announcements.filter(item => item.visibleOnStage) as item}
                 <div class="rounded-xl border border-orange-300/30 bg-orange-500/15 p-3"><strong class="text-xs text-orange-200">紧急通知</strong><p class="mt-1 text-lg font-bold">{item.text}</p></div>
               {/each}
-              {#each $desk.cues.filter(item => item.status === 'confirmed').slice(-2) as cue}
+              {#each $desk.cues.filter(item => item.status === 'confirmed' && !item.offline).slice(-2) as cue}
                 <div class="rounded-xl bg-white/10 p-3">
                   <div class="mb-1 flex justify-between text-[10px] text-teal-200"><span>{speakerName($desk, cue.speakerId)}</span><span>{formatTime(cue.receivedAt)}</span></div>
                   <p class="text-base leading-relaxed lg:text-lg">{cue.text}</p>
                 </div>
               {/each}
-              {#if !$desk.cues.some(item => item.status === 'confirmed') && !$desk.announcements.some(item => item.visibleOnStage)}
+              {#if !$desk.cues.some(item => item.status === 'confirmed' && !item.offline) && !$desk.announcements.some(item => item.visibleOnStage)}
                 <p class="py-5 text-center text-sm text-teal-100/60">确认传译或发布通知后，现场可见内容将在这里出现。</p>
               {/if}
             </div>
@@ -214,7 +248,7 @@
               <div class="flex items-center gap-3 text-xs text-slate-500"><span>自动接入</span><button type="button" role="switch" aria-label="自动接入现场文字" aria-checked={$desk.liveSimulation} class="focus-ring h-6 w-11 rounded-full p-1 transition {$desk.liveSimulation ? 'bg-teal-600' : 'bg-slate-300'}" on:click={() => setLiveSimulation(!$desk.liveSimulation)}><span class="block h-4 w-4 rounded-full bg-white transition {$desk.liveSimulation ? 'translate-x-5' : ''}"></span></button></div>
             </div>
             <div class="max-h-[600px] space-y-2 overflow-y-auto p-3 scrollbar-thin">
-              {#each $desk.cues as cue, index}
+              {#each liveCues as cue, index}
                 <!-- svelte-ignore a11y_no_noninteractive_element_to_interactive_role -->
                 <article role="button" tabindex="0" class="cue-enter cursor-pointer rounded-xl border p-3 transition {cue.id === $desk.activeCueId ? 'border-teal-600 bg-teal-50 shadow-md' : 'border-slate-200 bg-white hover:border-slate-300'}" on:click={() => selectCue(cue)} on:keydown={event => (event.key === 'Enter' || event.key === ' ') && selectCue(cue)}>
                   <div class="flex flex-wrap items-start gap-3">
@@ -224,13 +258,16 @@
                         <span class="rounded-md bg-slate-100 px-2 py-1 text-slate-600">{speakerName($desk, cue.speakerId)}</span>
                         <span class="rounded-md border px-2 py-1 {delayClass(getDelay(cue, now))}">{formatTime(cue.receivedAt)} · 延迟 {getDelay(cue, now)}s</span>
                         <span class="rounded-md px-2 py-1 {cue.status === 'confirmed' ? 'bg-emerald-100 text-emerald-800' : cue.status === 'followup' ? 'bg-amber-100 text-amber-900' : 'bg-blue-100 text-blue-800'}">{statusLabel(cue.status)}</span>
-                        {#if cue.offline}<span class="rounded-md bg-amber-100 px-2 py-1 text-amber-900">离线暂存</span>{/if}
                         {#if cue.manual}<span class="rounded-md bg-slate-100 px-2 py-1 text-slate-600">手工</span>{/if}
+                        {#each resolvedReviews.filter(item => item.resultCueId === cue.id) as mark}
+                          <span class="rounded-md bg-violet-100 px-2 py-1 text-violet-800">{resolutionLabel(mark.resolution)}</span>
+                        {/each}
+                        {#if cue.relatedTo}<span class="rounded-md bg-sky-100 px-2 py-1 text-sky-800">与第 {liveCues.findIndex(item => item.id === cue.relatedTo) + 1 || '—'} 条关联</span>{/if}
                       </div>
                       <p class="text-sm leading-6 lg:text-base">{cue.text}</p>
                       {#if cue.duplicateOf}
                         <div class="mt-2 flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
-                          <span><strong>疑似重复：</strong>与第 {$desk.cues.findIndex(item => item.id === cue.duplicateOf) + 1} 条高度相似</span>
+                          <span><strong>疑似重复：</strong>与第 {liveCues.findIndex(item => item.id === cue.duplicateOf) + 1} 条高度相似</span>
                           <button class="font-black underline" on:click|stopPropagation={() => clearDuplicate(cue.id)}>确认非重复</button>
                         </div>
                       {/if}
@@ -349,28 +386,62 @@
     {/if}
 
     {#if tab === 'offline'}
-      <div class="mb-5"><p class="text-[10px] font-black uppercase tracking-[.18em] text-amber-700">断网继续工作 · 恢复后合并</p><h1 class="mt-1 text-3xl font-black">手工录入与离线暂存</h1></div>
+      <div class="mb-5"><p class="text-[10px] font-black uppercase tracking-[.18em] text-amber-700">断网继续工作 · 恢复后先核对再入库</p><h1 class="mt-1 text-3xl font-black">手工录入、离线暂存与恢复核对</h1></div>
       <div class="grid gap-4 xl:grid-cols-[.9fr_1.1fr]">
         <section class="offline-hatch rounded-2xl border border-amber-200 bg-white p-5 shadow-sm">
           <div class="mb-4 flex items-center justify-between gap-3"><div><h2 class="font-black">手工录入现场文字</h2><p class="text-xs text-slate-500">按 Ctrl + Enter 也可以提交。</p></div><span class="rounded-full px-3 py-1 text-xs font-bold {$desk.online ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-900'}">{$desk.online ? '在线写入队列' : '离线保存本机'}</span></div>
           <label class="text-xs font-bold">发言人或场次<select class="focus-ring mt-2 w-full rounded-xl border p-3" bind:value={manualSpeakerId}><option value="">跟随当前发言人</option>{#each $desk.speakers as speaker}<option value={speaker.id}>{speaker.name}</option>{/each}</select></label>
           <label class="mt-4 block text-xs font-bold">现场文字<textarea bind:this={manualInput} class="focus-ring mt-2 w-full rounded-xl border p-4 text-base leading-7" rows="8" bind:value={manualText} placeholder="网络中断时，在这里继续录入…" on:keydown={event => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') submitManual() }}></textarea></label>
           <Button class="mt-3 w-full" size="lg" disabled={!manualText.trim()} on:click={submitManual}>加入队列</Button>
-          <div class="mt-4 rounded-xl bg-amber-50 p-3 text-xs text-amber-900"><strong>暂存规则：</strong>离线条目会带“本地”标记；恢复连接后自动与本机队列合并，并执行相似内容检测。</div>
+          <div class="mt-4 rounded-xl bg-amber-50 p-3 text-xs text-amber-900"><strong>暂存规则：</strong>离线条目只保存在本机；恢复连接后进入待核对队列——完全相同的内容自动并入原条目并留下记录，相近内容保留两版由你决定，未处理完不会进入现场输出。</div>
         </section>
-        <section class="rounded-2xl border bg-white p-5 shadow-sm">
-          <div class="mb-4 flex flex-wrap items-center justify-between gap-3"><div><h2 class="font-black">合并与冲突检查</h2><p class="text-xs text-slate-500">当前有 {offlineCount} 条离线条目，{duplicateCount} 条疑似重复。</p></div><Button disabled={$desk.online || !offlineCount} color="green" on:click={mergeOffline}>恢复连接并合并</Button></div>
-          <div class="space-y-3">
-            {#each $desk.cues.filter(item => item.offline) as cue}
-              <article class="rounded-xl border border-dashed border-amber-300 bg-amber-50/60 p-4">
-                <div class="flex items-center justify-between text-[10px] font-bold text-amber-800"><span>本机暂存 · {formatTime(cue.receivedAt)}</span><span>{speakerName($desk, cue.speakerId)}</span></div>
-                <textarea class="focus-ring mt-3 w-full rounded-xl border border-amber-200 bg-white p-3 text-sm" rows="3" value={cue.text} on:change={event => updateCue(cue.id, { text: (event.target as HTMLTextAreaElement).value })}></textarea>
-                <div class="mt-2 flex justify-between"><span class="text-[10px] text-amber-800">等待恢复网络后进入现场队列</span><button class="text-xs font-bold text-red-700 underline" on:click={() => deleteCue(cue.id)}>删除暂存</button></div>
-              </article>
-            {/each}
-            {#if !offlineCount}<div class="grid min-h-60 place-items-center rounded-xl bg-slate-50 text-center"><div><div class="mx-auto grid h-14 w-14 place-items-center rounded-full bg-emerald-100 text-2xl text-emerald-700">✓</div><strong class="mt-3 block text-sm">没有离线暂存条目</strong><p class="mt-1 text-xs text-slate-500">可断开网络后测试手工录入与恢复合并。</p></div></div>{/if}
-          </div>
-        </section>
+        <div class="space-y-4">
+          <section class="rounded-2xl border bg-white p-5 shadow-sm">
+            <div class="mb-4 flex flex-wrap items-center justify-between gap-3"><div><h2 class="font-black">待核对队列</h2><p class="text-xs text-slate-500">恢复连接后相近内容保留两版，处理完成前不会进入现场输出。</p></div><span class="rounded-full px-3 py-1 text-xs font-black {pendingReviews.length ? 'bg-red-100 text-red-800' : 'bg-emerald-100 text-emerald-800'}">{pendingReviews.length} 条待处理</span></div>
+            <div class="space-y-3">
+              {#each pendingReviews as item}
+                <article class="rounded-xl border border-amber-300 bg-amber-50/40 p-4">
+                  <div class="flex flex-wrap items-center justify-between gap-2 text-[10px] font-bold"><span class="rounded-md bg-amber-100 px-2 py-1 text-amber-900">相似度 {Math.round(item.similarity * 100)}% · 待核对</span><span class="text-slate-500">{speakerName($desk, item.speakerId)} · 暂存于 {formatTime(item.receivedAt)}</span></div>
+                  <div class="mt-3 grid gap-3 md:grid-cols-2">
+                    <div class="rounded-lg border border-amber-200 bg-amber-50 p-3"><strong class="text-[10px] font-black uppercase tracking-wider text-amber-800">版本 A · 离线暂存</strong><p class="mt-1 text-sm leading-6">{item.stagedText}</p></div>
+                    <div class="rounded-lg border border-slate-200 bg-slate-50 p-3"><strong class="text-[10px] font-black uppercase tracking-wider text-slate-500">版本 B · 现场已有</strong><p class="mt-1 text-sm leading-6">{reviewText(item.matchCueId)}</p></div>
+                  </div>
+                  <div class="mt-3 flex flex-wrap gap-2">
+                    <Button size="sm" color="yellow" on:click={() => resolveReview(item.id, 'use-staged')}>采用暂存版</Button>
+                    <Button size="sm" color="light" on:click={() => resolveReview(item.id, 'keep-live')}>采用现场版</Button>
+                    <Button size="sm" color="blue" on:click={() => resolveReview(item.id, 'linked')}>两版保留并关联</Button>
+                  </div>
+                </article>
+              {/each}
+              {#if !pendingReviews.length}<p class="rounded-xl bg-slate-50 py-4 text-center text-xs text-slate-500">没有待核对的恢复内容。</p>{/if}
+            </div>
+          </section>
+          <section class="rounded-2xl border bg-white p-5 shadow-sm">
+            <div class="mb-4 flex flex-wrap items-center justify-between gap-3"><div><h2 class="font-black">离线暂存</h2><p class="text-xs text-slate-500">当前有 {offlineCount} 条离线条目，恢复连接后自动进入核对流程。</p></div><Button disabled={$desk.online || !offlineCount} color="green" on:click={mergeOffline}>恢复连接并合并</Button></div>
+            <div class="space-y-3">
+              {#each $desk.cues.filter(item => item.offline) as cue}
+                <article class="rounded-xl border border-dashed border-amber-300 bg-amber-50/60 p-4">
+                  <div class="flex items-center justify-between text-[10px] font-bold text-amber-800"><span>本机暂存 · {formatTime(cue.receivedAt)}</span><span>{speakerName($desk, cue.speakerId)}</span></div>
+                  <textarea class="focus-ring mt-3 w-full rounded-xl border border-amber-200 bg-white p-3 text-sm" rows="3" value={cue.text} on:change={event => updateCue(cue.id, { text: (event.target as HTMLTextAreaElement).value })}></textarea>
+                  <div class="mt-2 flex justify-between"><span class="text-[10px] text-amber-800">等待恢复网络后进入待核对队列</span><button class="text-xs font-bold text-red-700 underline" on:click={() => deleteCue(cue.id)}>删除暂存</button></div>
+                </article>
+              {/each}
+              {#if !offlineCount}<div class="grid min-h-40 place-items-center rounded-xl bg-slate-50 text-center"><div><div class="mx-auto grid h-14 w-14 place-items-center rounded-full bg-emerald-100 text-2xl text-emerald-700">✓</div><strong class="mt-3 block text-sm">没有离线暂存条目</strong><p class="mt-1 text-xs text-slate-500">可断开网络后测试手工录入与恢复核对。</p></div></div>{/if}
+            </div>
+          </section>
+          <section class="rounded-2xl border bg-white p-5 shadow-sm">
+            <div class="mb-4 flex flex-wrap items-center justify-between gap-3"><div><h2 class="font-black">处理记录</h2><p class="text-xs text-slate-500">合并与核对结果保存在本机，重新打开可继续处理。</p></div>{#if resolvedReviews.length}<button class="text-xs font-bold text-slate-500 underline" on:click={clearResolvedReviews}>清空已处理记录</button>{/if}</div>
+            <div class="max-h-72 space-y-2 overflow-y-auto scrollbar-thin">
+              {#each resolvedReviews as item}
+                <div class="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs">
+                  <div class="flex flex-wrap items-center justify-between gap-2"><strong class="text-slate-700">{resolutionLabel(item.resolution)}</strong><span class="text-slate-400">{item.resolvedAt ? formatTime(item.resolvedAt) : ''}</span></div>
+                  <p class="mt-1 leading-5 text-slate-600">{item.stagedText}</p>
+                </div>
+              {/each}
+              {#if !resolvedReviews.length}<p class="rounded-xl bg-slate-50 py-4 text-center text-xs text-slate-400">暂无合并或核对记录。</p>{/if}
+            </div>
+          </section>
+        </div>
       </div>
     {/if}
   </main>

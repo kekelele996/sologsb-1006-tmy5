@@ -1,5 +1,5 @@
 import { writable, get } from 'svelte/store'
-import type { Announcement, Cue, CueStatus, DeskState, Reminder, Session, Speaker, Term } from './types'
+import type { Announcement, Cue, CueStatus, DeskState, Reminder, ReviewItem, Session, Speaker, Term } from './types'
 
 const STORAGE_KEY = 'conference-cue-desk-v1'
 const speakers: Speaker[] = [
@@ -24,15 +24,15 @@ const terms: Term[] = [
 function initialCues(): Cue[] {
   const now = Date.now()
   return [
-    { id: 'cue-101', speakerId: 'sp-1', text: 'The urban heat island effect is not evenly distributed across a city.', receivedAt: now - 36000, status: 'confirmed', manual: false, offline: false, delaySeconds: 4, duplicateOf: null, followupText: '', tags: ['城市热岛'] },
-    { id: 'cue-102', speakerId: 'sp-1', text: 'Neighborhoods with less tree canopy can be several degrees warmer at night.', receivedAt: now - 19000, status: 'confirmed', manual: false, offline: false, delaySeconds: 6, duplicateOf: null, followupText: '补译：“夜间温差可达数摄氏度。”', tags: ['树冠覆盖率'] },
-    { id: 'cue-103', speakerId: 'sp-1', text: 'Our resilience strategy links cooling corridors with public health investments.', receivedAt: now - 9000, status: 'pending', manual: false, offline: false, delaySeconds: 11, duplicateOf: null, followupText: '', tags: ['韧性', '协同效益'] },
-    { id: 'cue-104', speakerId: 'sp-1', text: 'That data also reveals health equity gaps between districts.', receivedAt: now - 2500, status: 'pending', manual: false, offline: false, delaySeconds: 4, duplicateOf: null, followupText: '', tags: ['健康公平'] }
+    { id: 'cue-101', speakerId: 'sp-1', text: 'The urban heat island effect is not evenly distributed across a city.', receivedAt: now - 36000, status: 'confirmed', manual: false, offline: false, delaySeconds: 4, duplicateOf: null, followupText: '', tags: ['城市热岛'], relatedTo: null },
+    { id: 'cue-102', speakerId: 'sp-1', text: 'Neighborhoods with less tree canopy can be several degrees warmer at night.', receivedAt: now - 19000, status: 'confirmed', manual: false, offline: false, delaySeconds: 6, duplicateOf: null, followupText: '补译：“夜间温差可达数摄氏度。”', tags: ['树冠覆盖率'], relatedTo: null },
+    { id: 'cue-103', speakerId: 'sp-1', text: 'Our resilience strategy links cooling corridors with public health investments.', receivedAt: now - 9000, status: 'pending', manual: false, offline: false, delaySeconds: 11, duplicateOf: null, followupText: '', tags: ['韧性', '协同效益'], relatedTo: null },
+    { id: 'cue-104', speakerId: 'sp-1', text: 'That data also reveals health equity gaps between districts.', receivedAt: now - 2500, status: 'pending', manual: false, offline: false, delaySeconds: 4, duplicateOf: null, followupText: '', tags: ['健康公平'], relatedTo: null }
   ]
 }
 function demoState(): DeskState {
   return {
-    speakers, sessions, terms, cues: initialCues(), reminders: [], activeCueId: 'cue-103', fontScale: 100,
+    speakers, sessions, terms, cues: initialCues(), reminders: [], reviewQueue: [], activeCueId: 'cue-103', fontScale: 100,
     announcements: [
       { id: 'ann-1', level: 'info', text: '十点整有消防联动测试，请提醒会场人员保持镇定。', visibleOnStage: false, createdAt: new Date().toISOString() },
       { id: 'ann-2', level: 'urgent', text: '请下一位发言人提前到侧台候场。', visibleOnStage: false, createdAt: new Date().toISOString() }
@@ -45,7 +45,12 @@ function loadState(): DeskState {
   if (typeof localStorage === 'undefined') return demoState()
   try {
     const saved = localStorage.getItem(STORAGE_KEY)
-    return saved ? { ...demoState(), ...JSON.parse(saved), online: navigator.onLine } : demoState()
+    if (!saved) return demoState()
+    const parsed = JSON.parse(saved) as Partial<DeskState>
+    const base: DeskState = { ...demoState(), ...parsed, online: navigator.onLine }
+    base.cues = base.cues.map(cue => ({ ...cue, relatedTo: cue.relatedTo ?? null }))
+    base.reviewQueue = base.reviewQueue ?? []
+    return base
   } catch { return demoState() }
 }
 const history: DeskState[] = []
@@ -98,25 +103,88 @@ export function addAnnouncement(text: string, level: Announcement['level']) {
 export function publishAnnouncement(id: string, visible: boolean) { commit(state => { const item = state.announcements.find(row => row.id === id); if (item) item.visibleOnStage = visible }) }
 
 export function setOnline(online: boolean) {
+  const current = get(desk)
+  if (current.online === online && !current.cues.some(cue => cue.offline)) return
   commit(state => {
     state.online = online
-    if (online) {
-      state.cues.forEach(cue => {
-        if (cue.offline) {
-          cue.offline = false
-          const duplicate = findDuplicate(cue.text, state.cues.filter(item => item.id !== cue.id && !item.offline))
-          cue.duplicateOf = duplicate?.id || null
-        }
-      })
-    }
+    if (online) recoverStagedCues(state)
   })
 }
+function recoverStagedCues(state: DeskState) {
+  const staged = state.cues.filter(cue => cue.offline)
+  if (!staged.length) return
+  state.cues = state.cues.filter(cue => !cue.offline)
+  for (const cue of staged) {
+    const base = {
+      id: `rev-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      stagedText: cue.text, speakerId: cue.speakerId, receivedAt: cue.receivedAt, manual: cue.manual
+    }
+    const exact = state.cues.find(item => normalizeText(item.text) === normalizeText(cue.text))
+    if (exact) {
+      state.reviewQueue.unshift({ ...base, matchKind: 'exact', matchCueId: exact.id, similarity: 1, status: 'resolved', resolution: 'merged', resultCueId: exact.id, resolvedAt: Date.now() })
+      continue
+    }
+    const match = bestMatch(cue.text, state.cues)
+    if (match && match.score >= SIMILAR_THRESHOLD) {
+      state.reviewQueue.unshift({ ...base, matchKind: 'similar', matchCueId: match.cue.id, similarity: match.score, status: 'pending', resolution: null, resultCueId: null, resolvedAt: null })
+      continue
+    }
+    cue.offline = false
+    cue.duplicateOf = null
+    state.cues.push(cue)
+    state.reviewQueue.unshift({ ...base, matchKind: 'none', matchCueId: null, similarity: match?.score ?? 0, status: 'resolved', resolution: 'admitted', resultCueId: cue.id, resolvedAt: Date.now() })
+  }
+  if (!state.cues.some(cue => cue.id === state.activeCueId && !cue.offline)) state.activeCueId = state.cues.filter(cue => !cue.offline).at(-1)?.id || ''
+}
+export function resolveReview(id: string, action: 'use-staged' | 'keep-live' | 'linked') {
+  commit(state => {
+    const item = state.reviewQueue.find(row => row.id === id)
+    if (!item || item.status !== 'pending') return
+    const target = state.cues.find(cue => cue.id === item.matchCueId)
+    if (!target) {
+      admitStaged(state, item)
+    } else if (action === 'use-staged') {
+      target.text = item.stagedText
+      target.tags = detectTerms(item.stagedText, state.terms)
+      target.duplicateOf = null
+      item.resultCueId = target.id
+      item.resolution = 'use-staged'
+    } else if (action === 'linked') {
+      const cue = stagedAsCue(state, item, item.matchCueId)
+      state.cues.push(cue)
+      item.resultCueId = cue.id
+      item.resolution = 'linked'
+    } else {
+      item.resultCueId = target.id
+      item.resolution = 'keep-live'
+    }
+    item.status = 'resolved'
+    item.resolvedAt = Date.now()
+  })
+}
+function admitStaged(state: DeskState, item: ReviewItem) {
+  const cue = stagedAsCue(state, item, null)
+  state.cues.push(cue)
+  item.resultCueId = cue.id
+  item.resolution = 'admitted'
+}
+function stagedAsCue(state: DeskState, item: ReviewItem, relatedTo: string | null): Cue {
+  return {
+    id: `cue-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    speakerId: item.speakerId, text: item.stagedText, receivedAt: item.receivedAt,
+    status: 'pending', manual: item.manual, offline: false,
+    delaySeconds: Math.max(0, Math.round((Date.now() - item.receivedAt) / 1000)),
+    duplicateOf: null, followupText: '', tags: detectTerms(item.stagedText, state.terms), relatedTo
+  }
+}
+export function clearResolvedReviews() { commit(state => { state.reviewQueue = state.reviewQueue.filter(item => item.status === 'pending') }) }
 export function setLiveSimulation(enabled: boolean) { commit(state => { state.liveSimulation = enabled }) }
 export function setActiveCue(id: string) { commit(state => { state.activeCueId = id }) }
 export function moveCue(direction: 1 | -1) {
   const state = get(desk)
-  const index = state.cues.findIndex(item => item.id === state.activeCueId)
-  const next = state.cues[index + direction]
+  const live = state.cues.filter(item => !item.offline)
+  const index = live.findIndex(item => item.id === state.activeCueId)
+  const next = live[index + direction]
   if (next) setActiveCue(next.id)
 }
 export function setFontScale(scale: number) { commit(state => { state.fontScale = Math.min(150, Math.max(85, scale)) }) }
@@ -126,20 +194,25 @@ export function ingestCue(text: string, options: { manual?: boolean; speakerId?:
   if (!trimmed) return
   commit(state => {
     const existing = state.cues.filter(item => item.text !== trimmed)
-    const duplicate = findDuplicate(trimmed, existing)
+    const duplicate = state.online ? findDuplicate(trimmed, existing) : undefined
     const speakerId = options.speakerId || state.sessions.find(item => item.status === 'live')?.speakerId || state.speakers[0]?.id || ''
     const receivedAt = options.receivedAt || Date.now()
     const cue: Cue = {
       id: `cue-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, speakerId, text: trimmed, receivedAt,
       status: 'pending', manual: Boolean(options.manual), offline: !state.online, delaySeconds: Math.max(0, Math.round((Date.now() - receivedAt) / 1000)),
-      duplicateOf: duplicate?.id || null, followupText: '', tags: detectTerms(trimmed, state.terms)
+      duplicateOf: duplicate?.id || null, followupText: '', tags: detectTerms(trimmed, state.terms), relatedTo: null
     }
     state.cues.push(cue); state.activeCueId = cue.id
   })
 }
 export function updateCue(id: string, patch: Partial<Cue>) { commit(state => { const cue = state.cues.find(item => item.id === id); if (cue) Object.assign(cue, patch) }) }
 export function setCueStatus(id: string, status: CueStatus) { commit(state => { const cue = state.cues.find(item => item.id === id); if (cue) cue.status = status }) }
-export function deleteCue(id: string) { commit(state => { state.cues = state.cues.filter(item => item.id !== id); if (state.activeCueId === id) state.activeCueId = state.cues.at(-1)?.id || '' }) }
+export function deleteCue(id: string) {
+  commit(state => {
+    state.cues = state.cues.filter(item => item.id !== id)
+    if (state.activeCueId === id) state.activeCueId = state.cues.filter(item => !item.offline).at(-1)?.id || ''
+  })
+}
 export function clearDuplicate(id: string) { commit(state => { const cue = state.cues.find(item => item.id === id); if (cue) cue.duplicateOf = null }) }
 export function sendReminder(termId: string, cueId: string) {
   commit(state => {
@@ -158,7 +231,20 @@ function detectTerms(text: string, terms: Term[]): string[] {
   return terms.filter(term => lower.includes(term.source.toLowerCase()) || lower.includes(term.target)).map(term => term.target)
 }
 function findDuplicate(text: string, cues: Cue[]): Cue | undefined {
-  return cues.find(cue => similarity(text, cue.text) >= 0.72)
+  return cues.find(cue => similarity(text, cue.text) >= SIMILAR_THRESHOLD)
+}
+const SIMILAR_THRESHOLD = 0.72
+function normalizeText(text: string): string {
+  return text.trim().replace(/\s+/g, ' ').toLowerCase()
+}
+function bestMatch(text: string, cues: Cue[]): { cue: Cue; score: number } | null {
+  let best: Cue | null = null
+  let score = 0
+  for (const cue of cues) {
+    const value = similarity(text, cue.text)
+    if (value > score) { score = value; best = cue }
+  }
+  return best ? { cue: best, score } : null
 }
 function similarity(a: string, b: string): number {
   const grams = (value: string) => {
