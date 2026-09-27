@@ -1,5 +1,5 @@
 import { writable, get } from 'svelte/store'
-import type { Announcement, Cue, CueStatus, DeskState, Reminder, Session, Speaker, Term } from './types'
+import type { Announcement, Cue, CueStatus, DeskState, MergeAction, MergeRecord, Reminder, ReviewItem, Session, Speaker, Term } from './types'
 
 const STORAGE_KEY = 'conference-cue-desk-v1'
 const speakers: Speaker[] = [
@@ -24,15 +24,15 @@ const terms: Term[] = [
 function initialCues(): Cue[] {
   const now = Date.now()
   return [
-    { id: 'cue-101', speakerId: 'sp-1', text: 'The urban heat island effect is not evenly distributed across a city.', receivedAt: now - 36000, status: 'confirmed', manual: false, offline: false, delaySeconds: 4, duplicateOf: null, followupText: '', tags: ['城市热岛'] },
-    { id: 'cue-102', speakerId: 'sp-1', text: 'Neighborhoods with less tree canopy can be several degrees warmer at night.', receivedAt: now - 19000, status: 'confirmed', manual: false, offline: false, delaySeconds: 6, duplicateOf: null, followupText: '补译：“夜间温差可达数摄氏度。”', tags: ['树冠覆盖率'] },
-    { id: 'cue-103', speakerId: 'sp-1', text: 'Our resilience strategy links cooling corridors with public health investments.', receivedAt: now - 9000, status: 'pending', manual: false, offline: false, delaySeconds: 11, duplicateOf: null, followupText: '', tags: ['韧性', '协同效益'] },
-    { id: 'cue-104', speakerId: 'sp-1', text: 'That data also reveals health equity gaps between districts.', receivedAt: now - 2500, status: 'pending', manual: false, offline: false, delaySeconds: 4, duplicateOf: null, followupText: '', tags: ['健康公平'] }
+    { id: 'cue-101', speakerId: 'sp-1', text: 'The urban heat island effect is not evenly distributed across a city.', receivedAt: now - 36000, status: 'confirmed', manual: false, offline: false, reviewPending: false, delaySeconds: 4, duplicateOf: null, followupText: '', tags: ['城市热岛'], mergeRecords: [], linkedCueId: null },
+    { id: 'cue-102', speakerId: 'sp-1', text: 'Neighborhoods with less tree canopy can be several degrees warmer at night.', receivedAt: now - 19000, status: 'confirmed', manual: false, offline: false, reviewPending: false, delaySeconds: 6, duplicateOf: null, followupText: '补译：“夜间温差可达数摄氏度。”', tags: ['树冠覆盖率'], mergeRecords: [], linkedCueId: null },
+    { id: 'cue-103', speakerId: 'sp-1', text: 'Our resilience strategy links cooling corridors with public health investments.', receivedAt: now - 9000, status: 'pending', manual: false, offline: false, reviewPending: false, delaySeconds: 11, duplicateOf: null, followupText: '', tags: ['韧性', '协同效益'], mergeRecords: [], linkedCueId: null },
+    { id: 'cue-104', speakerId: 'sp-1', text: 'That data also reveals health equity gaps between districts.', receivedAt: now - 2500, status: 'pending', manual: false, offline: false, reviewPending: false, delaySeconds: 4, duplicateOf: null, followupText: '', tags: ['健康公平'], mergeRecords: [], linkedCueId: null }
   ]
 }
 function demoState(): DeskState {
   return {
-    speakers, sessions, terms, cues: initialCues(), reminders: [], activeCueId: 'cue-103', fontScale: 100,
+    speakers, sessions, terms, cues: initialCues(), reviews: [], reminders: [], activeCueId: 'cue-103', fontScale: 100,
     announcements: [
       { id: 'ann-1', level: 'info', text: '十点整有消防联动测试，请提醒会场人员保持镇定。', visibleOnStage: false, createdAt: new Date().toISOString() },
       { id: 'ann-2', level: 'urgent', text: '请下一位发言人提前到侧台候场。', visibleOnStage: false, createdAt: new Date().toISOString() }
@@ -41,11 +41,21 @@ function demoState(): DeskState {
   }
 }
 function clone<T>(value: T): T { return structuredClone(value) }
+/** 旧版本存档补齐新字段，保证升级后待核对队列仍可继续处理 */
+function migrate(state: DeskState): DeskState {
+  state.cues.forEach(cue => {
+    if (!Array.isArray(cue.mergeRecords)) cue.mergeRecords = []
+    if (cue.linkedCueId === undefined) cue.linkedCueId = null
+    if (cue.reviewPending === undefined) cue.reviewPending = false
+  })
+  if (!Array.isArray(state.reviews)) state.reviews = []
+  return state
+}
 function loadState(): DeskState {
   if (typeof localStorage === 'undefined') return demoState()
   try {
     const saved = localStorage.getItem(STORAGE_KEY)
-    return saved ? { ...demoState(), ...JSON.parse(saved), online: navigator.onLine } : demoState()
+    return saved ? migrate({ ...demoState(), ...JSON.parse(saved), online: navigator.onLine }) : demoState()
   } catch { return demoState() }
 }
 const history: DeskState[] = []
@@ -97,19 +107,161 @@ export function addAnnouncement(text: string, level: Announcement['level']) {
 }
 export function publishAnnouncement(id: string, visible: boolean) { commit(state => { const item = state.announcements.find(row => row.id === id); if (item) item.visibleOnStage = visible }) }
 
-export function setOnline(online: boolean) {
+export interface ReconnectResult {
+  identical: number
+  similar: number
+  released: number
+  /** 恢复时不存在离线暂存，没有任何条目需要核对 */
+  nothing: boolean
+}
+
+export function setOnline(online: boolean): ReconnectResult | null {
+  if (get(desk).online === online) return null
+  let result: ReconnectResult = { identical: 0, similar: 0, released: 0, nothing: false }
   commit(state => {
     state.online = online
-    if (online) {
-      state.cues.forEach(cue => {
-        if (cue.offline) {
-          cue.offline = false
-          const duplicate = findDuplicate(cue.text, state.cues.filter(item => item.id !== cue.id && !item.offline))
-          cue.duplicateOf = duplicate?.id || null
-        }
-      })
-    }
+    if (online) result = runReconnectReview(state)
   })
+  return result
+}
+
+/**
+ * 恢复连接后的合并闸门：
+ * - 完全相同：自动并入原条目，在原条目留下合并记录，暂存条目不进入现场队列；
+ * - 相近内容：生成待核对单并保留两版，核对完成前双方都不得进入现场输出；
+ * - 不重复：正常放行进入现场队列。
+ */
+function runReconnectReview(state: DeskState): ReconnectResult {
+  const offlineCues = state.cues.filter(cue => cue.offline)
+  if (!offlineCues.length) return { identical: 0, similar: 0, released: 0, nothing: true }
+  const result: ReconnectResult = { identical: 0, similar: 0, released: 0, nothing: false }
+  for (const incoming of offlineCues) {
+    incoming.offline = false
+    const baseline = state.cues.filter(item => item.id !== incoming.id && !item.offline && !item.reviewPending)
+    const identical = baseline.find(item => normalizeText(item.text) === normalizeText(incoming.text))
+    if (identical) {
+      appendMergeRecord(identical, {
+        at: Date.now(), action: 'identical', otherCueId: incoming.id,
+        detail: `离线暂存的完全相同内容（${formatClock(incoming.receivedAt)} 录入）已自动并入本条。`
+      })
+      state.cues = state.cues.filter(item => item.id !== incoming.id)
+      result.identical++
+      continue
+    }
+    const similar = findDuplicate(incoming.text, baseline)
+    if (similar) {
+      incoming.reviewPending = true
+      similar.reviewPending = true
+      state.reviews.unshift({
+        id: `rev-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        status: 'pending', incomingCueId: incoming.id, existingCueId: similar.id,
+        incomingText: incoming.text, existingText: similar.text, incomingReceivedAt: incoming.receivedAt,
+        similarity: similarity(incoming.text, similar.text),
+        resolution: null, relationNote: '', createdAt: Date.now(), resolvedAt: null
+      })
+      result.similar++
+      continue
+    }
+    incoming.duplicateOf = findDuplicate(incoming.text, baseline)?.id || null
+    result.released++
+  }
+  return result
+}
+
+function appendMergeRecord(cue: Cue, record: MergeRecord) {
+  cue.mergeRecords.unshift(record)
+  if (cue.mergeRecords.length > 20) cue.mergeRecords.length = 20
+}
+
+/** 待核对未处理完的条目不得进入现场输出（也不允许确认已传） */
+export function isHeldFromStage(cue: Cue, state: DeskState = get(desk)): boolean {
+  return cue.reviewPending || state.reviews.some(review => review.status === 'pending' && (review.incomingCueId === cue.id || review.existingCueId === cue.id))
+}
+
+const resolutionLabels: Record<MergeAction, string> = {
+  identical: '完全相同 · 自动合并',
+  'keep-existing': '采用现场原条目',
+  'use-incoming': '采用离线版本',
+  linked: '保留两版并关联'
+}
+export function resolutionLabel(action: MergeAction): string { return resolutionLabels[action] }
+
+export function resolveReview(reviewId: string, action: MergeAction, note = '') {
+  const state = get(desk)
+  const review = state.reviews.find(item => item.id === reviewId)
+  if (!review || review.status !== 'pending') return
+  const incoming = state.cues.find(item => item.id === review.incomingCueId)
+  const existing = state.cues.find(item => item.id === review.existingCueId)
+  if (!existing && !incoming) return
+  commit(next => {
+    const target = next.reviews.find(item => item.id === reviewId)
+    if (!target || target.status !== 'pending') return
+    const inc = next.cues.find(item => item.id === target.incomingCueId)
+    const exc = next.cues.find(item => item.id === target.existingCueId)
+    const resolvedAt = Date.now()
+    // 其中一版在核对前被删除：保留尚存版本并解除闸门
+    if (!inc || !exc) {
+      const survivor = inc || exc
+      if (survivor) {
+        survivor.reviewPending = false
+        appendMergeRecord(survivor, {
+          at: resolvedAt, action: !inc ? 'keep-existing' : 'use-incoming', otherCueId: (!inc ? target.incomingCueId : target.existingCueId),
+          detail: '其中一版在核对前被删除，自动按保留版本处理。'
+        })
+      }
+      target.status = 'resolved'
+      target.resolution = !inc ? 'keep-existing' : 'use-incoming'
+      target.relationNote = '其中一版在核对前被删除，自动按保留版本处理。'
+      target.resolvedAt = resolvedAt
+      return
+    }
+    target.status = 'resolved'
+    target.resolution = action
+    target.relationNote = note.trim()
+    target.resolvedAt = resolvedAt
+
+    if (action === 'use-incoming' && inc && exc) {
+      exc.text = inc.text
+      exc.tags = detectTerms(inc.text, next.terms)
+      appendMergeRecord(exc, {
+        at: resolvedAt, action, otherCueId: inc.id,
+        detail: `采用离线暂存版本（${formatClock(inc.receivedAt)} 录入），原现场版本已被替换。`
+      })
+      next.cues = next.cues.filter(item => item.id !== inc.id)
+    } else if (action === 'keep-existing' && inc && exc) {
+      appendMergeRecord(exc, {
+        at: resolvedAt, action, otherCueId: inc.id,
+        detail: `内容相近，经同传人员核对采用现场原条目；离线版本（${formatClock(inc.receivedAt)} 录入）未采用。`
+      })
+      next.cues = next.cues.filter(item => item.id !== inc.id)
+    } else if (action === 'linked') {
+      const relation = note.trim()
+      if (inc) {
+        inc.reviewPending = false
+        inc.linkedCueId = exc?.id || null
+        appendMergeRecord(inc, {
+          at: resolvedAt, action, otherCueId: exc?.id || '',
+          detail: relation ? `保留两版关联：${relation}` : '与现场版本内容相近，保留两版并建立关联。'
+        })
+      }
+      if (exc) {
+        exc.reviewPending = false
+        exc.linkedCueId = inc?.id || null
+        appendMergeRecord(exc, {
+          at: resolvedAt, action, otherCueId: inc?.id || '',
+          detail: relation ? `保留两版关联：${relation}` : '与离线暂存版本内容相近，保留两版并建立关联。'
+        })
+      }
+    }
+    if (exc) exc.reviewPending = false
+  })
+}
+
+function normalizeText(value: string): string {
+  return value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '')
+}
+function formatClock(timestamp: number): string {
+  return new Date(timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
 }
 export function setLiveSimulation(enabled: boolean) { commit(state => { state.liveSimulation = enabled }) }
 export function setActiveCue(id: string) { commit(state => { state.activeCueId = id }) }
@@ -131,15 +283,39 @@ export function ingestCue(text: string, options: { manual?: boolean; speakerId?:
     const receivedAt = options.receivedAt || Date.now()
     const cue: Cue = {
       id: `cue-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, speakerId, text: trimmed, receivedAt,
-      status: 'pending', manual: Boolean(options.manual), offline: !state.online, delaySeconds: Math.max(0, Math.round((Date.now() - receivedAt) / 1000)),
-      duplicateOf: duplicate?.id || null, followupText: '', tags: detectTerms(trimmed, state.terms)
+      status: 'pending', manual: Boolean(options.manual), offline: !state.online, reviewPending: false, delaySeconds: Math.max(0, Math.round((Date.now() - receivedAt) / 1000)),
+      duplicateOf: duplicate?.id || null, followupText: '', tags: detectTerms(trimmed, state.terms), mergeRecords: [], linkedCueId: null
     }
     state.cues.push(cue); state.activeCueId = cue.id
   })
 }
 export function updateCue(id: string, patch: Partial<Cue>) { commit(state => { const cue = state.cues.find(item => item.id === id); if (cue) Object.assign(cue, patch) }) }
-export function setCueStatus(id: string, status: CueStatus) { commit(state => { const cue = state.cues.find(item => item.id === id); if (cue) cue.status = status }) }
-export function deleteCue(id: string) { commit(state => { state.cues = state.cues.filter(item => item.id !== id); if (state.activeCueId === id) state.activeCueId = state.cues.at(-1)?.id || '' }) }
+export function setCueStatus(id: string, status: CueStatus) {
+  commit(state => {
+    const cue = state.cues.find(item => item.id === id)
+    // 待核对未处理完的内容不能进入现场输出（确认即会进入现场）
+    if (cue && status === 'confirmed' && isHeldFromStage(cue, state)) return
+    if (cue) cue.status = status
+  })
+}
+export function deleteCue(id: string) {
+  commit(state => {
+    state.cues = state.cues.filter(item => item.id !== id)
+    // 若删除的是待核对条目，解除对方闸门并把核对单标记为已处理，避免卡死
+    const linked = state.reviews.filter(review => review.status === 'pending' && (review.incomingCueId === id || review.existingCueId === id))
+    linked.forEach(review => {
+      review.status = 'resolved'
+      review.resolution = review.incomingCueId === id ? 'keep-existing' : 'use-incoming'
+      review.relationNote = '其中一版在核对前被删除，按保留版本处理。'
+      review.resolvedAt = Date.now()
+      const otherId = review.incomingCueId === id ? review.existingCueId : review.incomingCueId
+      const other = state.cues.find(item => item.id === otherId)
+      if (other) other.reviewPending = false
+    })
+    state.cues.forEach(cue => { if (cue.linkedCueId === id) cue.linkedCueId = null })
+    if (state.activeCueId === id) state.activeCueId = state.cues.at(-1)?.id || ''
+  })
+}
 export function clearDuplicate(id: string) { commit(state => { const cue = state.cues.find(item => item.id === id); if (cue) cue.duplicateOf = null }) }
 export function sendReminder(termId: string, cueId: string) {
   commit(state => {
